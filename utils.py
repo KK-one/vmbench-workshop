@@ -435,6 +435,61 @@ class Workshop:
             for name in ['config.json', 'generation_config.json', 'preprocessor_config.json', 'special_tokens_map.json', 'tokenizer.model', 'tokenizer_config.json', 'pytorch_model.bin.index.json', 'pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']:
                 self.hf_file('q-future/one-align', name, self.cache / 'q-future/one-align' / name)
 
+    def initialize(self):
+        """Validate an existing submodule/GPU, prepare environments, and fetch selected weights.
+
+        No repository cloning or video preprocessing occurs here. Checkpoint downloads are
+        idempotent. Strict FP16 MSS is rejected on a small GPU before downloading its weights.
+        """
+        if self.config.repo_dir is None:
+            raise RuntimeError('Initialization requires an existing VMBench submodule via repo_dir.')
+        self.setup_errors.pop('repository', None)
+        self.install_repository()
+        if 'repository' in self.setup_errors:
+            raise RuntimeError('VMBench submodule check failed: ' + self.setup_errors['repository'])
+        check = subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--'], cwd=self.repo,
+                               capture_output=True, text=True)
+        if check.returncode:
+            raise RuntimeError('VMBench tracked files are modified or incomplete. Restore the pinned checkout.')
+        subprocess.run(['git', 'fsck', '--connectivity-only', '--no-dangling'], cwd=self.repo,
+                       capture_output=True, check=True, text=True)
+        try:
+            import torch
+        except ImportError:
+            raise RuntimeError('PyTorch is missing. Use a Google Colab GPU runtime.') from None
+        if not torch.cuda.is_available():
+            raise RuntimeError('No CUDA GPU. Select Runtime → Change runtime type → T4 GPU.')
+        self.config.gpu_available = True
+        self.config.gpu_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+        print(f'GPU: {torch.cuda.get_device_name(0)} | {self.gpu_gib:.2f} GiB')
+        if 'MSS' in self.config.metrics_to_run and self.config.mss_mode == 'fp16' and self.gpu_gib < 22:
+            raise RuntimeError('MSS FP16 needs a larger GPU. Select precomputed or 8bit_experimental on T4.')
+        checkpoint_metrics = []
+        for metric in self.config.metrics_to_run:
+            if metric == 'MSS' and self.config.mss_mode == 'precomputed':
+                print('MSS: instructor CSV mode; One-Align weights will not be downloaded.')
+                continue
+            if metric == 'MSS' and 'PAS' not in checkpoint_metrics:
+                checkpoint_metrics.append('PAS')
+            if metric not in checkpoint_metrics:
+                checkpoint_metrics.append(metric)
+        for step, method in [('apt', self.install_system_dependencies), ('host', self.install_host_packages)]:
+            self.setup_errors.pop(step, None)
+            method()
+            if step in self.setup_errors:
+                raise RuntimeError(f'{step} setup failed: {self.setup_errors[step]}')
+        if set(checkpoint_metrics) & {'PAS', 'TCS', 'MSS', 'CAS'}:
+            self.ensure_environment('core')
+        if 'OIS' in checkpoint_metrics:
+            self.ensure_environment('ois')
+        print('Checkpoint downloads:', ', '.join(checkpoint_metrics) or 'none')
+        print('Cache:', self.cache)
+        for metric in checkpoint_metrics:
+            self.ensure_checkpoints(metric)
+        self.load_precomputed()
+        print('Initialization complete.')
+        return self
+
     def normalize_uploaded(self, path):
         path = Path(path)
         if path.suffix.lower() == '.mp4':
@@ -770,7 +825,21 @@ class Workshop:
         else:
             print('Установка GPU evaluator’ов отложена: GPU отсутствует или они не выбраны.')
 
-    def load_videos(self):
+    def load_videos(self, folder=None, limit=None):
+        """Read a prepared folder without changing source files; fall back to upload/demo.
+
+        Folder inputs keep their original bytes/names. Contest IDs and labels are deliberately
+        not inferred from directory names. Optional upload conversion uses the runtime cache.
+        """
+        if limit is not None and (not isinstance(limit, int) or limit < 1):
+            raise ValueError('limit must be a positive integer or None.')
+        if folder is not None and Path(folder).is_dir():
+            prepared = sorted(p.resolve() for p in Path(folder).rglob('*')
+                              if p.is_file() and p.suffix.lower() in {'.mp4', '.mov', '.webm'})
+            if prepared:
+                self.input_paths = prepared[:limit] if limit is not None else prepared
+                print(f'Prepared videos: {len(self.input_paths)} of {len(prepared)}')
+                return self.input_paths
         self.input_paths = []
         urls = {name: url.strip() for name, url in self.config.videos.items() if url.strip()}
         try:
@@ -810,6 +879,8 @@ class Workshop:
         except Exception as error:
             (self.run_dir / 'video_input_error.log').write_text(traceback.format_exc())
             print('Video input failed:', error, '| лог:', self.run_dir / 'video_input_error.log')
+        if limit is not None:
+            self.input_paths = self.input_paths[:limit]
         print('Видео:', [p.name for p in self.input_paths])
         return self.input_paths
 
@@ -951,6 +1022,20 @@ def current_workshop() -> Workshop:
     if _SESSION is None:
         raise RuntimeError('Сначала выполните configure(WorkshopConfig(...)).')
     return _SESSION
+
+
+def initialize(project_dir, metrics=('PAS', 'OIS', 'TCS', 'MSS', 'CAS'), *,
+               mss_mode='precomputed', precomputed_url='', video_meta=None,
+               create_variants=False, work_dir=None):
+    """Notebook entry point: initialize a checkout that already contains vendor/vmbench."""
+    config = WorkshopConfig(
+        work_dir=Path(work_dir) if work_dir is not None else Path('/content'),
+        repo_dir=Path(project_dir).resolve() / 'vendor' / 'vmbench',
+        metrics_to_run=list(metrics), mss_mode=mss_mode, precomputed_url=precomputed_url,
+        video_meta=video_meta if video_meta is not None else {},
+        create_variants=create_variants, run_variant_comparisons=create_variants,
+    )
+    return configure(config).initialize()
 
 
 def compute_pas(path): return current_workshop().compute_pas(path)
