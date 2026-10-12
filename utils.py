@@ -7,7 +7,11 @@ Optional notebook dependencies are imported only when their features are used.
 """
 from __future__ import annotations
 
+import csv
 import gc
+import re
+import tempfile
+import zipfile
 import hashlib
 import json
 import os
@@ -37,8 +41,174 @@ OIS_SIZES = {'rtmdet_person.pth': 99021988, 'rtmpose_body7.pth': 54551099}
 SCORE_KEYS = {'PAS': 'perceptible_amplitude_score', 'OIS': 'object_integrity_score', 'TCS': 'temporal_coherence_score', 'MSS': 'motion_smoothness_score', 'CAS': 'commonsense_adherence_score'}
 
 METRIC_NAMES = ['PAS', 'OIS', 'TCS', 'MSS', 'CAS']
+DEFAULT_METRICS = ('PAS', 'OIS', 'TCS', 'CAS')
 
 LABELS = {'REAL_NORMAL', 'GENERATED', 'FAST', 'SLOW'}
+
+
+def contest_video_paths(folder):
+    """List anonymized contest MP4 files without reading any ground truth."""
+    paths = sorted(p for p in Path(folder).glob('*.mp4') if p.is_file())
+    if not paths or any(not re.fullmatch(r'[0-9a-f]{6}', p.stem) for p in paths):
+        raise ValueError('Expected MP4 videos named with unique six-character HEX IDs.')
+    return paths
+
+
+def unpack_contest_archive(archive, destination):
+    """Extract only contest videos, including an uploaded ZIP nested in Kaggle's ZIP.
+
+    CSVs and other files are ignored. Member directory names never become local paths.
+    The original video bytes are preserved; class labels are not inferred.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    seen = set()
+
+    def extract(path, depth=0):
+        if depth > 3:
+            raise ValueError('Too many nested ZIP archives.')
+        with zipfile.ZipFile(path) as z:
+            for member in z.infolist():
+                if member.is_dir():
+                    continue
+                name = Path(member.filename.replace('\\', '/')).name
+                if name.lower().endswith('.zip'):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        nested = Path(temporary) / 'nested.zip'
+                        with z.open(member) as src, nested.open('wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                        extract(nested, depth + 1)
+                elif re.fullmatch(r'[0-9a-f]{6}\.mp4', name):
+                    if name in seen:
+                        raise ValueError(f'Duplicate contest video ID: {name}')
+                    seen.add(name)
+                    target = destination / name
+                    partial = target.with_suffix('.mp4.part')
+                    try:
+                        with z.open(member) as src, partial.open('wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                        partial.replace(target)
+                    finally:
+                        partial.unlink(missing_ok=True)
+
+    extract(archive)
+    if not seen:
+        raise ValueError('The archive contains no contest MP4 videos with HEX IDs.')
+    return [destination / name for name in sorted(seen)]
+
+
+def download_contest(competition, work_dir='/content/kaggle_data'):
+    """Download private competition data with the official, isolated Kaggle CLI.
+
+    Each participant must join the competition and accept its rules in the browser.
+    Credentials come from their environment, Colab secret or masked input, never code.
+    """
+    from urllib.parse import urlparse
+    if not competition:
+        competition = input('Kaggle competition URL or slug: ').strip()
+    if '://' in competition:
+        url = urlparse(competition)
+        parts = url.path.strip('/').split('/')
+        if url.hostname not in {'kaggle.com', 'www.kaggle.com'} or len(parts) < 2 or parts[0] not in {'competitions', 'c'}:
+            raise ValueError('Use the /competitions/<slug> URL, not an invitation /t/ URL.')
+        competition = parts[1]
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', competition):
+        raise ValueError('Enter the competition slug or its /competitions/<slug> URL.')
+    cache = Path(work_dir) / competition
+    video_dir = cache / 'contest_vids'
+    marker = cache / 'ready.json'
+    if marker.exists():
+        cached = json.loads(marker.read_text())
+        if cached and all((video_dir / name).is_file() and (video_dir / name).stat().st_size == size
+                          for name, size in cached.items()):
+            print(f'Kaggle cache: {video_dir} ({len(cached)} videos)')
+            return video_dir
+    cache.mkdir(parents=True, exist_ok=True)
+    archive = cache / f'{competition}.zip'
+    if not archive.is_file():
+        env = os.environ.copy()
+        credential_files = [Path.home() / '.kaggle' / name for name in ('access_token', 'kaggle.json')]
+        if not env.get('KAGGLE_API_TOKEN') and not (env.get('KAGGLE_USERNAME') and env.get('KAGGLE_KEY')) and not any(p.is_file() for p in credential_files):
+            token = ''
+            try:
+                from google.colab import userdata
+                token = userdata.get('KAGGLE_API_TOKEN')
+            except Exception:
+                pass
+            if not token:
+                from getpass import getpass
+                print('Create a token at https://www.kaggle.com/settings/api (Generate New Token).')
+                token = getpass('Kaggle API token (hidden): ').strip()
+            if not token:
+                raise ValueError('A personal Kaggle API token is required for private data.')
+            env['KAGGLE_API_TOKEN'] = token
+        from importlib.util import find_spec
+        if find_spec('uv') is None:
+            subprocess.run([sys.executable, '-m', 'pip', '-q', 'install', 'uv==0.8.22'], check=True)
+        env['UV_CACHE_DIR'] = str(Path(work_dir) / '.cache' / 'uv')
+        command = [sys.executable, '-m', 'uv', 'tool', 'run', '--from', 'kaggle==2.2.4',
+                   'kaggle', 'competitions', 'download', competition, '-p', str(cache), '-q']
+        print(f'Downloading {competition}: contest videos and public template; cache: {cache}')
+        result = subprocess.run(command, env=env, capture_output=True, text=True)
+        output = result.stdout + '\n' + result.stderr
+        for key in ('KAGGLE_API_TOKEN', 'KAGGLE_KEY'):
+            if env.get(key):
+                output = output.replace(env[key], '[REDACTED]')
+        log = cache / 'download.log'
+        log.write_text(output)
+        if result.returncode:
+            raise RuntimeError(f'Kaggle download failed. Join the competition, accept its rules, '
+                               f'and check your token. Details: {log}') from None
+    if not archive.is_file():
+        raise RuntimeError(f'Kaggle did not create the expected archive: {archive}')
+    try:
+        paths = unpack_contest_archive(archive, video_dir)
+    except (ValueError, zipfile.BadZipFile, RuntimeError) as error:
+        raise RuntimeError(f'Cannot unpack contest data: {error}. Remove {archive} and retry.') from None
+    marker.write_text(json.dumps({p.name: p.stat().st_size for p in paths}, indent=2))
+    print(f'Contest videos: {len(paths)} | {video_dir}')
+    return video_dir
+
+
+def write_binary_submission(paths, output_path, predictions=None):
+    """Write all-real baseline or complete participant labels; never use source labels."""
+    ids = sorted(Path(path).stem for path in paths)
+    if not ids or len(set(ids)) != len(ids) or any(not re.fullmatch(r'[0-9a-f]{6}', x) for x in ids):
+        raise ValueError('Submission requires unique six-character HEX video IDs.')
+    labels = {video_id: 0 for video_id in ids} if predictions is None else predictions
+    if set(labels) != set(ids):
+        missing, extra = set(ids) - set(labels), set(labels) - set(ids)
+        raise ValueError(f'Provide one label for every contest video: {len(missing)} missing, '
+                         f'{len(extra)} unknown IDs.')
+    if any(str(value) not in {'0', '1'} for value in labels.values()):
+        raise ValueError('Labels must be 0 (real) or 1 (generated).')
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['video_id', 'label'])
+        writer.writerows((video_id, labels[video_id]) for video_id in ids)
+    print(f'Submission: {output_path} ({len(ids)} videos)')
+    return output_path
+
+
+def browse_contest(paths):
+    """Preview one contest video at a time without loading all clips into the output."""
+    import ipywidgets as widgets
+    from IPython.display import Video, display
+    paths = [Path(p) for p in paths]
+    selector = widgets.Dropdown(options=[(p.stem, str(p)) for p in paths], description='Video ID:')
+    output = widgets.Output()
+
+    def show(change=None):
+        with output:
+            output.clear_output(wait=True)
+            display(Video(selector.value, embed=True, width=480))
+
+    selector.observe(show, names='value')
+    display(selector, output)
+    show()
+    return selector
 
 RUNNER_SOURCE = r'''
 import argparse, os, sys, json, gc, traceback
@@ -228,7 +398,7 @@ class WorkshopConfig:
     video_meta: dict[str, dict] = field(default_factory=dict)
     default_subject: dict = field(default_factory=lambda: {
         'subject_noun': 'person', 'subject_type': 'human', 'prompt': 'A person moves in the scene.'})
-    metrics_to_run: list[str] = field(default_factory=lambda: ['PAS','OIS','TCS','MSS','CAS'])
+    metrics_to_run: list[str] = field(default_factory=lambda: list(DEFAULT_METRICS))
     mss_mode: str = 'precomputed'
     precomputed_url: str = ''
     create_variants: bool = False
@@ -744,7 +914,7 @@ class Workshop:
         compute = {'PAS': self.compute_pas, 'OIS': self.compute_ois, 'TCS': self.compute_tcs, 'MSS': self.compute_mss, 'CAS': self.compute_cas}[metric]
         self.display(self.pd.DataFrame([{'variant': name, metric: compute(str(path))} for name, path in self.variants.items()]))
 
-    def evaluate_video(self, path, metrics=('PAS', 'OIS', 'TCS', 'MSS', 'CAS')):
+    def evaluate_video(self, path, metrics=DEFAULT_METRICS):
         functions = {'PAS': self.compute_pas, 'OIS': self.compute_ois, 'TCS': self.compute_tcs, 'MSS': self.compute_mss, 'CAS': self.compute_cas}
         unknown = set(metrics) - set(functions)
         if unknown:
@@ -945,7 +1115,7 @@ class Workshop:
             rows = [self.evaluate_video(path, self.config.metrics_to_run) for path in self.video_paths]
         elif self.video_path:
             rows = [self.one_video_result]
-        results_df = self.pd.DataFrame(rows).reindex(columns=['video', *METRIC_NAMES])
+        results_df = self.pd.DataFrame(rows).reindex(columns=['video', *self.config.metrics_to_run])
         results_path = self.work_dir / 'vmbench_results.csv'
         results_df.to_csv(results_path, index=False)
         self.display(results_df)
@@ -967,7 +1137,7 @@ class Workshop:
         return results_df
 
     def plot_results(self, results_df):
-        for metric in METRIC_NAMES:
+        for metric in self.config.metrics_to_run:
             numeric = self.pd.to_numeric(results_df[metric], errors='coerce')
             valid = results_df.loc[numeric.notna(), ['video']].copy()
             valid[metric] = numeric[numeric.notna()]
@@ -986,7 +1156,7 @@ class Workshop:
             self.plt.show()
 
     def student_table(self):
-        student_df = self.pd.DataFrame({'Video': ['A', 'B', 'C', 'D'], **{column: [''] * 4 for column in ['Human guess', 'PAS', 'OIS', 'TCS', 'MSS', 'CAS', 'Final guess']}})
+        student_df = self.pd.DataFrame({'Video': ['A', 'B', 'C', 'D'], **{column: [''] * 4 for column in ['Human guess', *self.config.metrics_to_run, 'Final guess']}})
         self.display(student_df)
         student_df.to_csv(self.work_dir / 'student_experiment.csv', index=False)
         return student_df
@@ -1024,7 +1194,7 @@ def current_workshop() -> Workshop:
     return _SESSION
 
 
-def initialize(project_dir, metrics=('PAS', 'OIS', 'TCS', 'MSS', 'CAS'), *,
+def initialize(project_dir, metrics=DEFAULT_METRICS, *,
                mss_mode='precomputed', precomputed_url='', video_meta=None,
                create_variants=False, work_dir=None):
     """Notebook entry point: initialize a checkout that already contains vendor/vmbench."""
@@ -1047,7 +1217,7 @@ def get_video_info(path): return current_workshop().get_video_info(path)
 def show_video(path): return current_workshop().show_video(path)
 def clear_gpu(verbose=False): return current_workshop().clear_gpu(verbose=verbose)
 def compare_variants(metric): return current_workshop().compare_variants(metric)
-def evaluate_video(path, metrics=('PAS','OIS','TCS','MSS','CAS')):
+def evaluate_video(path, metrics=DEFAULT_METRICS):
     return current_workshop().evaluate_video(path, metrics)
 def validate_submission(df, expected_ids=None):
     return current_workshop().validate_submission(df, expected_ids)

@@ -9,3 +9,14 @@ videos/
 /vids/
 VMBench/
 *.part
+/contest_vids/
+/contest_solution.csv
+/contest_sample_submission.csv
+/contest_source_map.csv
+/contest_sandbox_perfect.csv
+/contest_vids.zip
+/contest_baseline_all_real.csv
+/kaggle_data/
+/baseline_all_real.csv
+/submission.csv
+/kaggle.json

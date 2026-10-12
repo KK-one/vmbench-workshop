@@ -1,5 +1,6 @@
 """Contract tests for utility extraction; no model weights or GPU are used."""
 import contextlib
+import csv
 import io
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -187,6 +189,83 @@ class UtilityContractTests(unittest.TestCase):
         log = self.workshop.logged_command(
             [sys.executable, '-c', 'import os; print(os.environ["HF_HOME"])'], 'child.log')
         self.assertIn(str(self.workshop.cache / 'huggingface'), log.read_text())
+
+    def test_nested_kaggle_zip_preserves_videos_and_ignores_answer_files(self):
+        nested = io.BytesIO()
+        with zipfile.ZipFile(nested, 'w') as z:
+            z.writestr('contest_vids/0abcde.mp4', b'first video bytes')
+            z.writestr('../../a0b1c2.mp4', b'second video bytes')
+        archive = self.work_dir / 'kaggle.zip'
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('contest_vids.zip', nested.getvalue())
+            z.writestr('contest_solution.csv', 'hidden answers')
+        dest = self.work_dir / 'extracted'
+        paths = utils.unpack_contest_archive(archive, dest)
+        self.assertEqual([p.name for p in paths], ['0abcde.mp4', 'a0b1c2.mp4'])
+        self.assertEqual(paths[0].read_bytes(), b'first video bytes')
+        self.assertEqual(paths[1].read_bytes(), b'second video bytes')
+        self.assertEqual(len(list(dest.iterdir())), 2)
+        self.assertFalse((self.work_dir / 'a0b1c2.mp4').exists())
+
+    def test_duplicate_contest_ids_in_archive_are_rejected(self):
+        archive = self.work_dir / 'duplicate.zip'
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('first/abcdef.mp4', b'one')
+            z.writestr('second/abcdef.mp4', b'two')
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            utils.unpack_contest_archive(archive, self.work_dir / 'dest')
+
+    def test_cached_kaggle_data_needs_no_credentials_or_network(self):
+        cache = self.work_dir / 'sample-contest'
+        cache.mkdir()
+        with zipfile.ZipFile(cache / 'sample-contest.zip', 'w') as z:
+            z.writestr('contest_vids/00abcd.mp4', b'video fixture')
+        with patch('utils.subprocess.run', side_effect=AssertionError('No network needed')):
+            first = utils.download_contest('https://www.kaggle.com/competitions/sample-contest/data', self.work_dir)
+            second = utils.download_contest('sample-contest', self.work_dir)
+        self.assertEqual(first, second)
+        self.assertEqual(utils.contest_video_paths(second)[0].read_bytes(), b'video fixture')
+
+    def test_invitation_url_is_not_used_as_api_competition_id(self):
+        with self.assertRaisesRegex(ValueError, 'invitation'):
+            utils.download_contest('https://www.kaggle.com/t/test-invitation', self.work_dir)
+
+    def test_binary_submission_preserves_hex_ids_and_covers_all_videos(self):
+        paths = [self.work_dir / '00abcd.mp4', self.work_dir / '123456.mp4']
+        path = utils.write_binary_submission(paths, self.work_dir / 'baseline.csv')
+        with path.open(newline='') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(rows, [{'video_id': '00abcd', 'label': '0'},
+                                {'video_id': '123456', 'label': '0'}])
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            utils.write_binary_submission(paths, path, {'00abcd': 1})
+        with self.assertRaisesRegex(ValueError, 'Labels'):
+            utils.write_binary_submission(paths, path, {'00abcd': 1, '123456': 0.5})
+        with path.open(newline='') as f:
+            self.assertEqual(list(csv.DictReader(f)), rows)
+
+    def test_default_t4_metrics_exclude_mss(self):
+        self.assertEqual(self.workshop.config.metrics_to_run, ['PAS', 'OIS', 'TCS', 'CAS'])
+
+    def test_kaggle_token_is_only_in_environment_and_redacted_from_log(self):
+        token = 'fixture-secret-not-a-real-key'
+
+        def download(command, **kwargs):
+            self.assertNotIn(token, command)
+            self.assertEqual(kwargs['env']['KAGGLE_API_TOKEN'], token)
+            archive = Path(command[command.index('-p') + 1]) / 'test-contest.zip'
+            with zipfile.ZipFile(archive, 'w') as z:
+                z.writestr('abcdef.mp4', b'video bytes')
+            return subprocess.CompletedProcess(command, 0, token, '')
+
+        with patch.dict(os.environ, {'KAGGLE_API_TOKEN': token}), \
+             patch('importlib.util.find_spec', return_value=object()), \
+             patch('utils.subprocess.run', side_effect=download):
+            result = utils.download_contest('test-contest', self.work_dir)
+        self.assertTrue((result / 'abcdef.mp4').is_file())
+        log = (result.parent / 'download.log').read_text()
+        self.assertNotIn(token, log)
+        self.assertIn('[REDACTED]', log)
 
 
 if __name__ == '__main__':
