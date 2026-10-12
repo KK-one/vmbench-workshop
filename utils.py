@@ -222,6 +222,7 @@ if __name__ == '__main__': main()
 @dataclass
 class WorkshopConfig:
     work_dir: Path = field(default_factory=lambda: Path('/content'))
+    repo_dir: Path | None = None
     videos: dict[str, str] = field(default_factory=dict)
     input_mode: str = 'auto'
     video_meta: dict[str, dict] = field(default_factory=dict)
@@ -245,6 +246,8 @@ class WorkshopConfig:
 
     def __post_init__(self):
         self.work_dir = Path(self.work_dir)
+        if self.repo_dir is not None:
+            self.repo_dir = Path(self.repo_dir).resolve()
         if self.input_mode not in {'auto','upload','demo'}:
             raise ValueError('input_mode должен быть auto, upload или demo.')
         if self.mss_mode not in {'precomputed','fp16','8bit_experimental'}:
@@ -259,7 +262,7 @@ class Workshop:
     def __init__(self, config: WorkshopConfig):
         self.config = config
         self.work_dir = config.work_dir
-        self.repo = self.work_dir / 'VMBench'
+        self.repo = config.repo_dir or self.work_dir / 'VMBench'
         self.cache = self.repo / '.cache'
         self.video_dir = self.work_dir / 'videos'
         self.run_dir = self.work_dir / 'vmbench_runs'
@@ -717,7 +720,9 @@ class Workshop:
 
     def install_repository(self):
         try:
-            if not self.repo.exists():
+            if self.config.repo_dir is not None and not (self.repo / '.git').exists():
+                raise RuntimeError('Submodule VMBench не загружен. Повторите git clone --recurse-submodules или git submodule update --init --recursive.')
+            if self.config.repo_dir is None and not self.repo.exists():
                 self.logged_command(['git', 'clone', 'https://github.com/AMAP-ML/VMBench.git', self.repo], 'clone.log')
                 self.logged_command(['git', 'checkout', '--detach', self.config.vmbench_commit], 'checkout.log', cwd=self.repo)
             actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.repo, text=True).strip()
@@ -932,7 +937,8 @@ _SESSION: Workshop | None = None
 def configure(config: WorkshopConfig) -> Workshop:
     """Configure explicitly; repeating the config cell preserves results in the same runtime."""
     global _SESSION
-    if _SESSION is None or _SESSION.work_dir != config.work_dir:
+    target_repo = config.repo_dir or config.work_dir / 'VMBench'
+    if _SESSION is None or _SESSION.work_dir != config.work_dir or _SESSION.repo != target_repo:
         _SESSION = Workshop(config)
     else:
         _SESSION.config = config

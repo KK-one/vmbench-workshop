@@ -86,6 +86,24 @@ class UtilityContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             utils.WorkshopConfig(metrics_to_run=['UNKNOWN'])
 
+    def test_explicit_submodule_path_is_used(self):
+        path = self.work_dir / 'vendor' / 'vmbench'
+        session = utils.Workshop(utils.WorkshopConfig(work_dir=self.work_dir, repo_dir=path))
+        self.assertEqual(session.repo, path.resolve())
+        self.assertEqual(session.cache, path.resolve() / '.cache')
+
+    def test_missing_submodule_does_not_clone_another_repository(self):
+        path = self.work_dir / 'missing-submodule'
+        session = utils.Workshop(utils.WorkshopConfig(work_dir=self.work_dir, repo_dir=path))
+        session.logged_command = lambda *a, **k: self.fail('Explicit missing submodule must not clone elsewhere')
+        session.install_repository()
+        self.assertIn('Submodule', session.setup_errors['repository'])
+        self.assertFalse(path.exists())
+
+    def test_changing_repo_path_creates_new_session(self):
+        other = utils.configure(utils.WorkshopConfig(work_dir=self.work_dir, repo_dir=self.work_dir / 'vendor'))
+        self.assertIsNot(other, self.workshop)
+
     def test_child_command_uses_workshop_cache(self):
         log = self.workshop.logged_command(
             [sys.executable, '-c', 'import os; print(os.environ["HF_HOME"])'], 'child.log')

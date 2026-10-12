@@ -1,0 +1,3 @@
+[submodule "vendor/vmbench"]
+	path = vendor/vmbench
+	url = https://github.com/AMAP-ML/VMBench.git
