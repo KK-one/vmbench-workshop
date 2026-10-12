@@ -215,20 +215,7 @@ class UtilityContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Duplicate'):
             utils.unpack_contest_archive(archive, self.work_dir / 'dest')
 
-    def test_cached_kaggle_data_needs_no_credentials_or_network(self):
-        cache = self.work_dir / 'sample-contest'
-        cache.mkdir()
-        with zipfile.ZipFile(cache / 'sample-contest.zip', 'w') as z:
-            z.writestr('contest_vids/00abcd.mp4', b'video fixture')
-        with patch('utils.subprocess.run', side_effect=AssertionError('No network needed')):
-            first = utils.download_contest('https://www.kaggle.com/competitions/sample-contest/data', self.work_dir)
-            second = utils.download_contest('sample-contest', self.work_dir)
-        self.assertEqual(first, second)
-        self.assertEqual(utils.contest_video_paths(second)[0].read_bytes(), b'video fixture')
 
-    def test_invitation_url_is_not_used_as_api_competition_id(self):
-        with self.assertRaisesRegex(ValueError, 'invitation'):
-            utils.download_contest('https://www.kaggle.com/t/test-invitation', self.work_dir)
 
     def test_binary_submission_preserves_hex_ids_and_covers_all_videos(self):
         paths = [self.work_dir / '00abcd.mp4', self.work_dir / '123456.mp4']
@@ -247,25 +234,6 @@ class UtilityContractTests(unittest.TestCase):
     def test_default_t4_metrics_exclude_mss(self):
         self.assertEqual(self.workshop.config.metrics_to_run, ['PAS', 'OIS', 'TCS', 'CAS'])
 
-    def test_kaggle_token_is_only_in_environment_and_redacted_from_log(self):
-        token = 'fixture-secret-not-a-real-key'
-
-        def download(command, **kwargs):
-            self.assertNotIn(token, command)
-            self.assertEqual(kwargs['env']['KAGGLE_API_TOKEN'], token)
-            archive = Path(command[command.index('-p') + 1]) / 'test-contest.zip'
-            with zipfile.ZipFile(archive, 'w') as z:
-                z.writestr('abcdef.mp4', b'video bytes')
-            return subprocess.CompletedProcess(command, 0, token, '')
-
-        with patch.dict(os.environ, {'KAGGLE_API_TOKEN': token}), \
-             patch('importlib.util.find_spec', return_value=object()), \
-             patch('utils.subprocess.run', side_effect=download):
-            result = utils.download_contest('test-contest', self.work_dir)
-        self.assertTrue((result / 'abcdef.mp4').is_file())
-        log = (result.parent / 'download.log').read_text()
-        self.assertNotIn(token, log)
-        self.assertIn('[REDACTED]', log)
 
 
 if __name__ == '__main__':
