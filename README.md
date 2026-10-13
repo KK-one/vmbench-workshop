@@ -7,3 +7,14 @@
 5. Edit `baseline_all_real.csv`: **0 = real, 1 = generated**. Upload the CSV with columns `video_id,label` to Kaggle. Scoring is accuracy; all correct labels earn 100%.
 
 After a runtime reset, upload the ZIP and run all cells again. Videos and ground-truth files are excluded from Git.
+
+After metric setup, call the evaluators directly:
+
+```python
+pas = compute_pas(video_path, subject="dog", box_threshold=0.25, text_threshold=0.20, grid_size=30)
+ois = compute_ois(video_path, bbox_thr=0.3, nms_thr=0.3)
+tcs = compute_tcs(video_path, subject="dog", box_threshold=0.25, text_threshold=0.20, grid_size=50)
+cas = compute_cas(video_path, test_num_segment=10, test_num_crop=3, num_workers=1)
+```
+
+`subject` is English detection text; OIS evaluates people. Changing detector/tracker settings or CAS test views may change scores. Settings are recorded in diagnostics and included in the cache key.

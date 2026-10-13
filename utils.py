@@ -42,6 +42,36 @@ SCORE_KEYS = {'PAS': 'perceptible_amplitude_score', 'OIS': 'object_integrity_sco
 
 METRIC_NAMES = ['PAS', 'OIS', 'TCS', 'MSS', 'CAS']
 DEFAULT_METRICS = ('PAS', 'OIS', 'TCS', 'CAS')
+METRIC_DEFAULTS = {
+    'PAS': {'box_threshold': 0.25, 'text_threshold': 0.20, 'grid_size': 30},
+    'OIS': {'bbox_thr': 0.3, 'nms_thr': 0.3},
+    'TCS': {'box_threshold': 0.25, 'text_threshold': 0.20, 'grid_size': 50},
+    'CAS': {'test_num_segment': 10, 'test_num_crop': 3, 'num_workers': 1},
+    'MSS': {},
+}
+
+
+def metric_options(metric, options=None):
+    """Validate exposed evaluator settings; defaults preserve the workshop adapter."""
+    import math
+    from numbers import Integral, Real
+    result = METRIC_DEFAULTS[metric].copy()
+    if options:
+        unknown = set(options) - set(result)
+        if unknown:
+            raise ValueError(f'{metric}: unsupported parameters: {sorted(unknown)}')
+        result.update(options)
+    for name, value in result.items():
+        if name in {'box_threshold', 'text_threshold', 'bbox_thr', 'nms_thr'}:
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f'{name} must be a finite number between 0 and 1.')
+            result[name] = float(value)
+        else:
+            minimum = 0 if name == 'num_workers' else 2
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+                raise ValueError(f'{name} must be an integer >= {minimum}.')
+            result[name] = int(value)
+    return result
 
 LABELS = {'REAL_NORMAL', 'GENERATED', 'FAST', 'SLOW'}
 
@@ -175,18 +205,20 @@ def prepare_dino_fallback():
         ms_deform_attn.MultiScaleDeformableAttention = original_class
         print('GroundingDINO: official PyTorch deformable-attention fallback on GPU.')
 
-def pas(meta):
+def pas(meta, options):
     prepare_dino_fallback()
     run_official('perceptible_amplitude_score.py', [
-        '--meta_info_path', meta, '--box_threshold', '0.25', '--text_threshold', '0.20',
-        '--grid_size', '30', '--device', 'cuda'], [
+        '--meta_info_path', meta, '--box_threshold', str(options['box_threshold']),
+        '--text_threshold', str(options['text_threshold']),
+        '--grid_size', str(options['grid_size']), '--device', 'cuda'], [
         ('sam_predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2])',
          'sam_predictor.transform.apply_boxes_torch(boxes_filt, image_array.shape[:2])'),
         ("# save meta info per video", "meta_info['_pas_detected'] = int(boxes_filt.shape[0])\n        # save meta info per video")])
 
-def ois(meta):
+def ois(meta, options):
     run_official('object_integrity_score.py', [
         '--meta-info-path', meta, '--save-predictions', '--device', 'cuda:0',
+        '--bbox-thr', str(options['bbox_thr']), '--nms-thr', str(options['nms_thr']),
         '--det_checkpoint', str(Path('.cache/rtmdet_person.pth').resolve()),
         '--pose_checkpoint', str(Path('.cache/rtmpose_body7.pth').resolve())], [
         ('# predict keypoints',
@@ -194,7 +226,7 @@ def ois(meta):
         ('# show the results',
          "if not pose_results or not any(len(r.pred_instances.keypoints) for r in pose_results):\n        raise NotApplicable('No pose instances detected.')\n\n    # show the results")])
 
-def tcs(meta):
+def tcs(meta, options):
     prepare_dino_fallback()
     from sam2 import build_sam
     try:
@@ -212,8 +244,9 @@ def tcs(meta):
                     'torch.autocast(device_type="cuda", enabled=False).__enter__()'))
     print('T4-compatible TCS: BF16 autocast disabled; FP32 on every GPU.')
     run_official('temporal_coherence_score.py', [
-        '--meta_info_path', meta, '--box_threshold', '0.25', '--text_threshold', '0.20',
-        '--grid_size', '50', '--device', 'cuda'], patches)
+        '--meta_info_path', meta, '--box_threshold', str(options['box_threshold']),
+        '--text_threshold', str(options['text_threshold']),
+        '--grid_size', str(options['grid_size']), '--device', 'cuda'], patches)
 
 def mss(meta, mode):
     import motion_smoothness_score as official
@@ -240,7 +273,7 @@ def mss(meta, mode):
     Path(meta).write_text(json.dumps(records, indent=2))
     del scorer
 
-def cas(meta):
+def cas(meta, options):
     # Import from vendored VideoMAEv2 before importing its utility namespace.
     import models
     from dataset import build_dataset
@@ -257,12 +290,13 @@ def cas(meta):
             writer.writerow([item['filepath'], 0])
     args = SimpleNamespace(data_path=str(directory), data_root='',
         data_set='Commonsense-Adherence', sparse_sample=False, nb_classes=5,
-        num_frames=16, sampling_rate=4, test_num_segment=10, test_num_crop=3,
+        num_frames=16, sampling_rate=4, test_num_segment=options['test_num_segment'],
+        test_num_crop=options['test_num_crop'],
         input_size=224, short_side_size=224, reprob=0.25,
         aa='rand-m7-n4-mstd0.5-inc1', train_interpolation='bicubic')
     dataset, _ = build_dataset(is_train=False, test_mode=True, args=args)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1,
-                        pin_memory=True, persistent_workers=True, drop_last=False)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=options['num_workers'],
+                        pin_memory=True, persistent_workers=options['num_workers'] > 0, drop_last=False)
     with init_empty_weights():
         model = models.vit_giant_patch14_224(pretrained=False, img_size=224,
             num_classes=5, all_frames=16, tubelet_size=2, drop_rate=0.,
@@ -291,12 +325,14 @@ def main():
     parser = argparse.ArgumentParser(description='Workshop adapter; calls official VMBench evaluators.')
     parser.add_argument('--metric', choices=['PAS', 'OIS', 'TCS', 'MSS', 'CAS'], required=True)
     parser.add_argument('--meta', required=True)
+    parser.add_argument('--options', required=True, help='JSON file with validated evaluator settings')
     parser.add_argument('--mss-mode', default='fp16', choices=['fp16', '8bit_experimental'])
     args = parser.parse_args()
+    options = json.loads(Path(args.options).read_text())
     report = {'status': 'ok'}
     try:
         if args.metric == 'MSS': mss(args.meta, args.mss_mode)
-        else: {'PAS': pas, 'OIS': ois, 'TCS': tcs, 'CAS': cas}[args.metric](args.meta)
+        else: {'PAS': pas, 'OIS': ois, 'TCS': tcs, 'CAS': cas}[args.metric](args.meta, options)
         torch.cuda.synchronize()
         report['peak_allocated_gib'] = torch.cuda.max_memory_allocated() / 2**30
         report['peak_reserved_gib'] = torch.cuda.max_memory_reserved() / 2**30
@@ -337,7 +373,7 @@ class WorkshopConfig:
     max_input_pixels: int = 1280 * 720
     reuse_results: bool = True
     vmbench_commit: str = '9772be365784bc3f641d64fca018b1debb749116'
-    adapter_profile: str = 'colab-v1-fp32-tcs-pas-boxfix'
+    adapter_profile: str = 'colab-v2-parameters-fp32-tcs-pas-boxfix'
     gpu_available: bool = False
     gpu_gib: float = 0.0
 
@@ -661,17 +697,25 @@ class Workshop:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def metric_profile(self, metric):
-        return self.config.adapter_profile + ('-mss8bit' if metric == 'MSS' and self.config.mss_mode == '8bit_experimental' else '')
+    def metric_profile(self, metric, options=None, subject=None):
+        subject = subject or self.config.default_subject
+        payload = {'options': metric_options(metric, options)}
+        if metric in {'PAS', 'TCS'}:
+            payload['subject_noun'] = subject['subject_noun']
+        elif metric == 'OIS':
+            payload['subject_type'] = subject.get('subject_type')
+        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
+        return self.config.adapter_profile + ('-mss8bit' if metric == 'MSS' and self.config.mss_mode == '8bit_experimental' else '') + '-' + fingerprint
 
-    def precomputed_score(self, digest, metric):
+    def precomputed_score(self, digest, metric, profile=None):
         if not self.precomputed_path.is_file():
             return None
         table = self.pd.read_csv(self.precomputed_path)
         required = {'video_sha256', 'metric', 'score', 'runtime_sec', 'vmbench_commit', 'adapter_profile'}
         if not required.issubset(table.columns):
             raise ValueError('Precomputed CSV: отсутствуют колонки ' + str(required - set(table.columns)))
-        rows = table[(table.video_sha256 == digest) & (table.metric == metric) & (table.vmbench_commit == self.config.vmbench_commit) & (table.adapter_profile == self.metric_profile(metric))]
+        profile = profile or self.metric_profile(metric)
+        rows = table[(table.video_sha256 == digest) & (table.metric == metric) & (table.vmbench_commit == self.config.vmbench_commit) & (table.adapter_profile == profile)]
         if rows.empty:
             return None
         if len(rows) != 1:
@@ -696,8 +740,12 @@ class Workshop:
             return 'Checkpoint не соответствует официальной модели. Смотрите подробности в логе.'
         return message[:350]
 
-    def compute_metric(self, path, metric):
+    def compute_metric(self, path, metric, *, subject=None, options=None):
         import math
+        options = metric_options(metric, options)
+        if subject is not None and (not isinstance(subject, str) or not subject.strip()):
+            raise ValueError('subject must be a nonempty English object description, e.g. person or dog.')
+        subject_override = subject
         start_total = time.perf_counter()
         row = {'video': Path(path).name if path else '(no video)', 'metric': metric, 'score': None, 'runtime_sec': 0.0, 'original_runtime_sec': None, 'setup_sec': 0.0, 'status': 'skipped', 'source': 'none', 'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'vmbench_commit': self.config.vmbench_commit, 'adapter_profile': self.metric_profile(metric), 'video_sha256': None, 'message': '', 'log': None, 'peak_allocated_gib': None}
         cache_key, process_log, inference_start = (None, None, None)
@@ -709,11 +757,15 @@ class Workshop:
             if not path.is_file():
                 raise FileNotFoundError(f'Видео не найдено: {path}')
             subject = self.config.video_meta.get(path.name, self.config.default_subject).copy()
+            if subject_override is not None:
+                subject['subject_noun'] = subject_override.strip()
             if not str(subject.get('subject_noun', '')).strip():
                 raise ValueError('Укажите английское subject_noun в VIDEO_META.')
+            row['adapter_profile'] = self.metric_profile(metric, options, subject)
+            row['parameters'] = json.dumps({'subject': subject, 'options': options}, sort_keys=True)
             digest = self.video_sha256(path)
             row['video_sha256'] = digest
-            cache_key = (digest, metric, self.metric_profile(metric), json.dumps(subject, sort_keys=True))
+            cache_key = (digest, metric, row['adapter_profile'], json.dumps(subject, sort_keys=True))
             if self.config.reuse_results and cache_key in self.result_cache:
                 previous = self.result_cache[cache_key]
                 row.update(score=previous['score'], status=previous['status'], source='cache:' + previous['source'], message=previous['message'], log=previous['log'], original_runtime_sec=previous.get('original_runtime_sec') or previous['runtime_sec'])
@@ -721,7 +773,7 @@ class Workshop:
             if metric == 'OIS' and subject.get('subject_type') != 'human':
                 row.update(status='not_applicable', message='Официальный OIS CLI оценивает human pose, не этот тип субъекта.')
                 return None
-            teacher = self.precomputed_score(digest, metric)
+            teacher = self.precomputed_score(digest, metric, profile=row['adapter_profile'])
             if teacher is not None:
                 row.update(score=teacher[0], original_runtime_sec=teacher[1], status='ok', source='precomputed', message='Score преподавателя, совпали hash/revision/profile.')
                 return row['score']
@@ -767,9 +819,12 @@ class Workshop:
                 record[SCORE_KEYS['PAS']] = pas_value
             meta = job / 'results.json'
             meta.write_text(json.dumps([record], indent=2))
+            options_path = job / 'options.json'
+            options_path.write_text(json.dumps(options, indent=2))
             process_log = job / 'metric.log'
             row['log'] = str(process_log)
-            command = [str(python), str(self.runner), '--metric', metric, '--meta', str(meta)]
+            command = [str(python), str(self.runner), '--metric', metric, '--meta', str(meta),
+                       '--options', str(options_path)]
             if metric == 'MSS':
                 command += ['--mss-mode', self.config.mss_mode]
             print(f"{metric}: начало {row['timestamp_utc']} | {path.name} | log: {process_log}")
@@ -790,6 +845,9 @@ class Workshop:
             if not math.isfinite(value):
                 raise ValueError('Evaluator вернул NaN/Inf.')
             notes = []
+            if any(value != METRIC_DEFAULTS[metric][name] for name, value in options.items()
+                   if name != 'num_workers'):
+                notes.append('Custom evaluator settings; scores should be compared under matching settings.')
             if metric == 'PAS' and record.get('_pas_detected') == 0:
                 notes.append('Subject не обнаружен: upstream PAS использовал background motion.')
             if metric == 'TCS' and record.get('_tcs_objects') == 0:
@@ -819,27 +877,47 @@ class Workshop:
             if row['message']:
                 print(row['message'])
 
-    def compute_pas(self, path):
-        return self.compute_metric(path, 'PAS')
+    def compute_pas(self, path, *, subject=None, box_threshold=0.25, text_threshold=0.20, grid_size=30):
+        """PAS for a detected subject; English subject text goes to GroundingDINO before SAM.
 
-    def compute_ois(self, path):
-        return self.compute_metric(path, 'OIS')
+        Thresholds and CoTracker grid_size preserve the existing workshop defaults.
+        Returns a float, or None with diagnostics when evaluation is unavailable.
+        """
+        return self.compute_metric(path, 'PAS', subject=subject, options={
+            'box_threshold': box_threshold, 'text_threshold': text_threshold, 'grid_size': grid_size})
 
-    def compute_tcs(self, path):
-        return self.compute_metric(path, 'TCS')
+    def compute_ois(self, path, *, bbox_thr=0.3, nms_thr=0.3):
+        """Human-pose OIS; bbox confidence and NMS thresholds are official CLI settings."""
+        return self.compute_metric(path, 'OIS', options={'bbox_thr': bbox_thr, 'nms_thr': nms_thr})
+
+    def compute_tcs(self, path, *, subject=None, box_threshold=0.25, text_threshold=0.20, grid_size=50):
+        """TCS with an English subject prompt, detector thresholds and CoTracker grid size.
+
+        The official script derives its detector step from FPS, so step is not exposed.
+        """
+        return self.compute_metric(path, 'TCS', subject=subject, options={
+            'box_threshold': box_threshold, 'text_threshold': text_threshold, 'grid_size': grid_size})
 
     def compute_mss(self, path):
         return self.compute_metric(path, 'MSS')
 
-    def compute_cas(self, path):
-        return self.compute_metric(path, 'CAS')
+    def compute_cas(self, path, *, test_num_segment=10, test_num_crop=3, num_workers=1):
+        """Learned CAS; batch_size remains 1. Defaults use 10 x 3 official test views.
 
-    def compare_variants(self, metric):
+        Changing segment/crop counts changes evaluation sampling and may change scores.
+        Each count must be >=2 because the native loader divides by count minus one.
+        num_workers controls loading only; zero disables background workers.
+        """
+        return self.compute_metric(path, 'CAS', options={
+            'test_num_segment': test_num_segment, 'test_num_crop': test_num_crop,
+            'num_workers': num_workers})
+
+    def compare_variants(self, metric, **parameters):
         if not self.config.run_variant_comparisons or not self.variants:
             print('Для сравнения включите CREATE_VARIANTS и RUN_VARIANT_COMPARISONS.')
             return
         compute = {'PAS': self.compute_pas, 'OIS': self.compute_ois, 'TCS': self.compute_tcs, 'MSS': self.compute_mss, 'CAS': self.compute_cas}[metric]
-        self.display(self.pd.DataFrame([{'variant': name, metric: compute(str(path))} for name, path in self.variants.items()]))
+        self.display(self.pd.DataFrame([{'variant': name, metric: compute(str(path), **parameters)} for name, path in self.variants.items()]))
 
     def evaluate_video(self, path, metrics=DEFAULT_METRICS):
         functions = {'PAS': self.compute_pas, 'OIS': self.compute_ois, 'TCS': self.compute_tcs, 'MSS': self.compute_mss, 'CAS': self.compute_cas}
@@ -1036,9 +1114,14 @@ class Workshop:
         else:
             print('Пока нет запущенных метрик.')
 
-    def evaluate_dataset(self):
+    def evaluate_dataset(self, *, recompute=True):
         rows = []
-        if self.config.run_dataset:
+        if not recompute:
+            latest = {(row['video'], row['metric']): row['score'] for row in self.results}
+            rows = [{'video': Path(path).name,
+                     **{metric: latest.get((Path(path).name, metric)) for metric in self.config.metrics_to_run}}
+                    for path in self.video_paths]
+        elif self.config.run_dataset:
             rows = [self.evaluate_video(path, self.config.metrics_to_run) for path in self.video_paths]
         elif self.video_path:
             rows = [self.one_video_result]
@@ -1135,15 +1218,33 @@ def initialize(project_dir, metrics=DEFAULT_METRICS, *,
     return configure(config).initialize()
 
 
-def compute_pas(path): return current_workshop().compute_pas(path)
-def compute_ois(path): return current_workshop().compute_ois(path)
-def compute_tcs(path): return current_workshop().compute_tcs(path)
+def compute_pas(path, *, subject=None, box_threshold=0.25, text_threshold=0.20, grid_size=30):
+    """Score subject motion; subject is English detection text, e.g. person, dog, car."""
+    return current_workshop().compute_pas(path, subject=subject, box_threshold=box_threshold,
+                                         text_threshold=text_threshold, grid_size=grid_size)
+
+
+def compute_ois(path, *, bbox_thr=0.3, nms_thr=0.3):
+    """Score human structural integrity with bbox/NMS detection thresholds."""
+    return current_workshop().compute_ois(path, bbox_thr=bbox_thr, nms_thr=nms_thr)
+
+
+def compute_tcs(path, *, subject=None, box_threshold=0.25, text_threshold=0.20, grid_size=50):
+    """Score object persistence using English subject text and detector/tracker settings."""
+    return current_workshop().compute_tcs(path, subject=subject, box_threshold=box_threshold,
+                                         text_threshold=text_threshold, grid_size=grid_size)
+
+
 def compute_mss(path): return current_workshop().compute_mss(path)
-def compute_cas(path): return current_workshop().compute_cas(path)
+def compute_cas(path, *, test_num_segment=10, test_num_crop=3, num_workers=1):
+    """Score learned plausibility; changing the 10 x 3 test views changes evaluation sampling."""
+    return current_workshop().compute_cas(path, test_num_segment=test_num_segment,
+                                         test_num_crop=test_num_crop, num_workers=num_workers)
 def get_video_info(path): return current_workshop().get_video_info(path)
 def show_video(path): return current_workshop().show_video(path)
 def clear_gpu(verbose=False): return current_workshop().clear_gpu(verbose=verbose)
-def compare_variants(metric): return current_workshop().compare_variants(metric)
+def compare_variants(metric, **parameters):
+    return current_workshop().compare_variants(metric, **parameters)
 def evaluate_video(path, metrics=DEFAULT_METRICS):
     return current_workshop().evaluate_video(path, metrics)
 def validate_submission(df, expected_ids=None):

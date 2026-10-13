@@ -1,7 +1,9 @@
 """Contract tests for utility extraction; no model weights or GPU are used."""
 import contextlib
+import ast
 import csv
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -233,6 +235,110 @@ class UtilityContractTests(unittest.TestCase):
 
     def test_default_t4_metrics_exclude_mss(self):
         self.assertEqual(self.workshop.config.metrics_to_run, ['PAS', 'OIS', 'TCS', 'CAS'])
+
+    def test_invalid_metric_parameters_fail_before_loading_models(self):
+        invalid = [
+            lambda: utils.compute_pas('video.mp4', subject=''),
+            lambda: utils.compute_pas('video.mp4', grid_size=1),
+            lambda: utils.compute_tcs('video.mp4', box_threshold=float('nan')),
+            lambda: utils.compute_ois('video.mp4', nms_thr=1.5),
+            lambda: utils.compute_cas('video.mp4', test_num_crop=1),
+            lambda: utils.compute_cas('video.mp4', num_workers=-1),
+        ]
+        self.workshop.ensure_environment = Mock(side_effect=AssertionError('No model loading'))
+        for call in invalid:
+            with self.subTest(call=call), self.assertRaises(ValueError):
+                call()
+        self.workshop.ensure_environment.assert_not_called()
+
+    def metric_process_fixture(self):
+        self.workshop.config.gpu_available = True
+        self.workshop.config.gpu_gib = 15
+        self.workshop.get_video_info = Mock(return_value={
+            'frame_count': 10, 'fps': 24, 'width': 320, 'height': 240})
+        self.workshop.ensure_environment = Mock(return_value=Path(sys.executable))
+        self.workshop.ensure_checkpoints = Mock()
+        self.workshop.precomputed_score = Mock(return_value=None)
+        video = self.work_dir / 'abcdef.mp4'
+        video.write_bytes(b'metric fixture, never decoded')
+        calls = []
+
+        def process(command, **kwargs):
+            meta = Path(command[command.index('--meta') + 1])
+            options = json.loads(Path(command[command.index('--options') + 1]).read_text())
+            record = json.loads(meta.read_text())[0]
+            metric = command[command.index('--metric') + 1]
+            calls.append((metric, record.copy(), options))
+            record[utils.SCORE_KEYS[metric]] = options.get('box_threshold', 0.75)
+            meta.write_text(json.dumps([record]))
+            meta.with_name('process_report.json').write_text(json.dumps({'status': 'ok'}))
+            return subprocess.CompletedProcess(command, 0)
+
+        return video, calls, process
+
+    def test_subject_and_thresholds_reach_process_and_invalidate_cache(self):
+        video, calls, process = self.metric_process_fixture()
+        original_metadata = self.workshop.config.default_subject.copy()
+        with patch('utils.subprocess.run', side_effect=process):
+            self.assertEqual(utils.compute_pas(video, subject='dog'), 0.25)
+            self.assertEqual(utils.compute_pas(video, subject='dog'), 0.25)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(utils.compute_pas(video, subject='dog', box_threshold=0.4), 0.4)
+            self.assertEqual(utils.compute_pas(video, subject='cat', box_threshold=0.4), 0.4)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call[1]['subject_noun'] for call in calls], ['dog', 'dog', 'cat'])
+        self.assertEqual(calls[1][2]['box_threshold'], 0.4)
+        self.assertEqual(self.workshop.config.default_subject, original_metadata)
+        profiles = [r['adapter_profile'] for r in self.workshop.results]
+        self.assertEqual(profiles[0], profiles[1])
+        self.assertNotEqual(profiles[0], profiles[2])
+        self.assertNotEqual(profiles[2], profiles[3])
+        self.assertEqual(json.loads(self.workshop.results[-1]['parameters'])['subject']['subject_noun'], 'cat')
+
+    def test_other_public_functions_forward_settings_to_process(self):
+        video, calls, process = self.metric_process_fixture()
+        with patch('utils.subprocess.run', side_effect=process):
+            utils.compute_ois(video, bbox_thr=0.45, nms_thr=0.5)
+            utils.compute_tcs(video, subject='car', grid_size=20)
+            utils.compute_cas(video, test_num_segment=4, test_num_crop=2, num_workers=0)
+        self.assertEqual(calls[0][2], {'bbox_thr': 0.45, 'nms_thr': 0.5})
+        self.assertEqual(calls[1][1]['subject_noun'], 'car')
+        self.assertEqual(calls[1][2]['grid_size'], 20)
+        self.assertEqual(calls[2][2], {'test_num_segment': 4, 'test_num_crop': 2, 'num_workers': 0})
+
+    def test_runner_pas_and_ois_use_real_cli_arguments(self):
+        tree = ast.parse(utils.RUNNER_SOURCE)
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {'pas', 'ois'}]
+        run = Mock()
+        namespace = {'prepare_dino_fallback': Mock(), 'run_official': run, 'Path': Path}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), 'runner-contract.py', 'exec'), namespace)
+        namespace['pas']('meta.json', {'box_threshold': 0.4, 'text_threshold': 0.2, 'grid_size': 12})
+        args = run.call_args.args[1]
+        self.assertEqual(args[args.index('--box_threshold') + 1], '0.4')
+        self.assertEqual(args[args.index('--grid_size') + 1], '12')
+        namespace['ois']('meta.json', {'bbox_thr': 0.4, 'nms_thr': 0.2})
+        args = run.call_args.args[1]
+        self.assertEqual(args[args.index('--bbox-thr') + 1], '0.4')
+        self.assertEqual(args[args.index('--nms-thr') + 1], '0.2')
+
+    def test_result_export_can_collect_scores_without_recomputing(self):
+        try:
+            import pandas
+        except ImportError:
+            self.skipTest('pandas is an optional notebook dependency')
+        self.workshop.config.metrics_to_run = ['PAS']
+        self.workshop.video_paths = ['abcdef.mp4']
+        self.workshop.results = [{'video': 'abcdef.mp4', 'metric': 'PAS', 'score': 0.7,
+                                 'status': 'ok', 'source': 'cache:fixture', 'message': '',
+                                 'runtime_sec': 0, 'setup_sec': 0, 'video_sha256': 'fixture',
+                                 'vmbench_commit': self.workshop.config.vmbench_commit,
+                                 'adapter_profile': self.workshop.metric_profile('PAS')}]
+        self.workshop.evaluate_video = Mock(side_effect=AssertionError('Must not recompute'))
+        with patch('IPython.display.display'):
+            table = self.workshop.evaluate_dataset(recompute=False)
+        self.assertEqual(table.loc[0, 'PAS'], 0.7)
+        self.assertNotIn('MSS', table.columns)
+        self.workshop.evaluate_video.assert_not_called()
 
 
 
